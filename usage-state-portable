@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+Coleta de cotas de agentes — versão portável
+Cache inteligente: só roda zen-usage quando o DB muda ou janela expira
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "usage-widget" / "config.json"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "usage-widget"
+STATE = CACHE_DIR / "state.json"
+CCUSAGE_CACHE = CACHE_DIR / "ccusage-widget.json"
+CCUSAGE_TTL = 300  # 5 min
+
+DB = Path(os.environ.get("OPENCODE_DB", "~/.local/share/opencode/opencode.db")).expanduser()
+ZEN_SRC = Path("~/.local/bin/zen-usage").expanduser()
+ZEN_CACHE: dict = {"key": None, "data": None}
+
+ICONS = {
+    "opencode-go": "G", "gemini": "G", "copilot": "C", "amp": "A",
+    "claude": "C", "codex": "X", "opencode": "O",
+}
+
+def load_config() -> dict:
+    cfg = {"widget": {}, "future": []}
+    try:
+        user = json.loads(CONFIG.read_text())
+        if isinstance(user, dict):
+            cfg.update(user)
+    except Exception:
+        pass
+    return cfg
+
+def run_json(cmd: list[str], timeout: int = 20) -> dict | None:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+
+def _db_key() -> tuple:
+    key = []
+    for suf in ("", "-wal"):
+        try:
+            st = DB.with_name(DB.name + suf).stat()
+            key.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            key.append(None)
+    return tuple(key)
+
+def _zen_cache_valid(data: dict, now_ms: int) -> bool:
+    expiries = []
+    if data.get("oldest_5h"):
+        expiries.append(data["oldest_5h"] + 5 * 3600 * 1000)
+    if data.get("oldest_24h"):
+        expiries.append(data["oldest_24h"] + 24 * 3600 * 1000)
+    return not expiries or now_ms < min(expiries)
+
+def zen_data() -> dict | None:
+    key = _db_key()
+    now_ms = int(time.time() * 1000)
+    if ZEN_CACHE["data"] is not None and ZEN_CACHE["key"] == key and _zen_cache_valid(ZEN_CACHE["data"], now_ms):
+        data = ZEN_CACHE["data"]
+        fl = data.get("free_limit")
+        if fl and fl.get("until"):
+            fl["active"] = now_ms < int(fl["until"])
+        return data
+
+    exe = shutil.which("zen-usage") or str(ZEN_SRC)
+    data = run_json([exe, "--json"])
+    if data:
+        ZEN_CACHE["key"] = key
+        ZEN_CACHE["data"] = data
+    return data
+
+def ccusage_data() -> dict | None:
+    try:
+        if time.time() - CCUSAGE_CACHE.stat().st_mtime <= CCUSAGE_TTL:
+            return json.loads(CCUSAGE_CACHE.read_text())
+    except Exception:
+        pass
+    data = run_json([shutil.which("ccusage") or "ccusage", "--format", "json", "--by-agent"])
+    if data:
+        CCUSAGE_CACHE.write_text(json.dumps(data))
+    return data
+
+def _normalize_ccusage(data: dict) -> list[dict]:
+    """ccusage --by-agent pode retornar dict {agent: {tokens: N}} ou list [{agent, tokens}]"""
+    models = []
+    if not data:
+        return models
+    if isinstance(data, dict):
+        for agent, info in data.items():
+            if agent == "total":
+                continue
+            tokens = 0
+            if isinstance(info, dict):
+                tokens = info.get("tokens", 0)
+            elif isinstance(info, (int, float)):
+                tokens = int(info)
+            models.append({"name": agent, "tokens": tokens})
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                name = item.get("agent") or item.get("name") or "?"
+                tokens = item.get("tokens", 0)
+                models.append({"name": name, "tokens": tokens})
+    return models
+
+def write_state(state: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    os.replace(tmp, STATE)
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Coleta de cotas para usage-widget (portável)")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--watch", type=int, default=60)
+    args = ap.parse_args()
+
+    cfg = load_config()
+    interval = max(10, args.watch)
+
+    if args.once:
+        zen = zen_data()
+        cc = ccusage_data()
+        providers = []
+        models = _normalize_ccusage(cc)
+        used_5h = used_24h = 0
+        
+        if zen:
+            windows = zen.get("windows", {})
+            used_5h = windows.get("5h", {}).get("zen", 0)
+            used_24h = windows.get("24h", {}).get("zen", 0)
+            providers.append({
+                "id": "zen", "label": "OpenCode Zen", "icon": "Z", "kind": "requests",
+                "used": used_5h, "limit": None, "pct": None, "window": "5h",
+                "detail": f"24h {used_24h}", "blocked": False, "status": "ok",
+            })
+        
+        state = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "stale": False,
+            "zen": {"ok": bool(zen), "used": used_5h, "pct": 0, "detail": f"24h {used_24h}", "next_free": "", "blocked": False, "blocked_at": "", "blocked_until": ""},
+            "today": {"total": sum(m["tokens"] for m in models), "models": models[:6]},
+            "providers": providers,
+            "config": {"widget": cfg.get("widget", {})},
+        }
+        write_state(state)
+        return
+
+    # Loop com cache
+    while True:
+        zen = zen_data()
+        cc = ccusage_data()
+        providers = []
+        models = _normalize_ccusage(cc)
+        used_5h = used_24h = 0
+        next_free = ""
+        blocked = False
+        blocked_at = ""
+        blocked_until = ""
+        
+        if zen:
+            windows = zen.get("windows", {})
+            used_5h = windows.get("5h", {}).get("zen", 0)
+            used_24h = windows.get("24h", {}).get("zen", 0)
+            oldest_5h = zen.get("oldest_5h")
+            oldest_24h = zen.get("oldest_24h")
+            free_limit = zen.get("free_limit") or {}
+            
+            if oldest_5h:
+                next_free = datetime.fromtimestamp(oldest_5h / 1000 + 5 * 3600).strftime("%H:%M")
+            
+            blocked = bool(free_limit.get("active"))
+            if free_limit.get("at"):
+                blocked_at = datetime.fromtimestamp(free_limit["at"] / 1000).strftime("%d/%m %H:%M")
+            if free_limit.get("until"):
+                until_dt = datetime.fromtimestamp(free_limit["until"] / 1000)
+                fmt = "%H:%M" if until_dt.date() == datetime.now().date() else "%d/%m %H:%M"
+                blocked_until = until_dt.strftime(fmt)
+            
+            providers.append({
+                "id": "zen", "label": "OpenCode Zen", "icon": "Z", "kind": "requests",
+                "used": used_5h, "limit": None,
+                "pct": 1.0 if blocked else None,
+                "window": "5h", "detail": f"24h {used_24h}",
+                "next_free": next_free, "blocked": blocked,
+                "blocked_at": blocked_at, "blocked_until": blocked_until,
+                "status": "limit" if blocked else "ok",
+            })
+        
+        # Futuros (ccusage/budget)
+        for item in cfg.get("future", []):
+            name = item.get("name", "?")
+            src = item.get("source")
+            pid = item.get("id") or name.lower().replace(" ", "-")
+            icon = item.get("icon") or ICONS.get(pid, name[:1].upper())
+            entry = {"id": pid, "label": name, "icon": icon, "kind": src, "used": 0, "limit": None, "pct": None, "window": "", "detail": "", "blocked": False, "status": "ok"}
+            if src == "ccusage":
+                for m in models:
+                    if m["name"].lower() == item.get("agent", "").lower():
+                        entry["used"] = m["tokens"]
+                        entry["detail"] = f"{m['tokens']:,} tokens"
+                        break
+            elif src == "budget":
+                entry["detail"] = "franquia não configurada"
+            providers.append(entry)
+        
+        state = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "stale": False,
+            "zen": {"ok": bool(zen), "used": used_5h, "pct": 0 if not blocked else 100, "detail": f"24h {used_24h}", "next_free": next_free, "blocked": blocked, "blocked_at": blocked_at, "blocked_until": blocked_until},
+            "today": {"total": sum(m["tokens"] for m in models), "models": models[:6]},
+            "providers": providers,
+            "config": {"widget": cfg.get("widget", {})},
+        }
+        write_state(state)
+        time.sleep(interval)
+
+if __name__ == "__main__":
+    main()

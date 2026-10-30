@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""
+Coleta de métricas de sistema — versão portável (multi-distro, multi-compositor)
+Escreve em $XDG_RUNTIME_DIR/usage-widget/system.json (tmpfs, sem desgaste de SSD)
+
+Sub-cadências:
+  - 3s: CPU, RAM, disco, rede (loop rápido)
+  - 5s: temperaturas, bateria
+  - 10s: top processos (via /proc direto, 3-4x mais rápido que psutil)
+  - 30s: WiFi (SSID, dBm, IP local), screen-time
+  - 60s: ping do gateway (1 pacote, não sai da LAN)
+  - 30min: clima (Open-Meteo, cache em ~/.cache/usage-widget/weather.json)
+  - 3h:   atualizações de sistema (checkupdates/apt/dnf/nix/zypper)
+
+Uso:
+    sys-state-portable              # loop 3s
+    sys-state-portable --watch 3
+    sys-state-portable --once       # coleta única (rápido, sem rede lenta)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import date
+from pathlib import Path
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("sys-state-portable: falta python3-psutil")
+
+# ---------- Constantes e caminhos ----------
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "usage-widget"
+SYSTEM = RUNTIME / "system.json"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "usage-widget"
+WEATHER_CACHE = CACHE_DIR / "weather.json"
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+_slow_lock = threading.Lock()
+_slow: dict = {}
+
+# ---------- Configuração ----------
+DEFAULT_CFG = {
+    "refresh_seconds": 3,
+    "mount": "/",
+    "show": ["cpu", "mem", "disk", "net", "battery", "temp", "procs", "updates", "screentime", "weather"],
+    "temp_warn": 70,
+    "temp_crit": 85,
+    "cpu_crit": 90,
+    "battery_low": 20,
+    "procs_top": 5,
+    "weather_city": "auto",
+    "weather_lat": None,
+    "weather_lon": None,
+}
+
+def load_system_cfg() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CFG))
+    cfg_path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "usage-widget" / "config.json"
+    try:
+        user = json.loads(cfg_path.read_text())
+        if isinstance(user.get("widget"), dict) and isinstance(user["widget"].get("system"), dict):
+            cfg.update(user["widget"]["system"])
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+# ---------- Utilitários ----------
+def run_json(cmd: list[str], timeout: int = 5) -> dict | None:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+
+def run_text(cmd: list[str], timeout: int = 3) -> str | None:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return None
+
+# ---------- Coletores rápidos (loop 3s) ----------
+def cpu_info() -> dict:
+    total = psutil.cpu_percent(interval=None)
+    cores = psutil.cpu_percent(interval=None, percpu=True)
+    return {"total": round(total, 1), "cores": [round(c, 1) for c in cores]}
+
+def mem_info() -> dict:
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    return {
+        "total": vm.total,
+        "used": vm.used,
+        "free": vm.available,
+        "pct": round(vm.percent, 1),
+        "swap_total": swap.total,
+        "swap_used": swap.used,
+        "swap_pct": round(swap.percent, 1) if swap.total > 0 else -1,
+    }
+
+def disk_info(mount: str) -> dict:
+    try:
+        du = psutil.disk_usage(mount)
+        io = psutil.disk_io_counters()
+        return {
+            "total": du.total,
+            "used": du.used,
+            "free": du.free,
+            "pct": round(du.used / du.total * 100, 1),
+            "read_bps": io.read_bytes if io else 0,
+            "write_bps": io.write_bytes if io else 0,
+        }
+    except Exception:
+        return {"total": 0, "used": 0, "free": 0, "pct": -1, "read_bps": 0, "write_bps": 0}
+
+def net_info() -> dict:
+    try:
+        nio = psutil.net_io_counters(pernic=True)
+        # Soma todas as interfaces não-loopback
+        down = up = 0
+        for name, stats in nio.items():
+            if name != "lo":
+                down += stats.bytes_recv
+                up += stats.bytes_sent
+        return {"down_bps": down, "up_bps": up}
+    except Exception:
+        return {"down_bps": 0, "up_bps": 0}
+
+def temps_info() -> list[dict]:
+    """Detecta sensores conhecidos e retorna lista padronizada."""
+    out = []
+    try:
+        temps = psutil.sensors_temperatures()
+        for name, entries in temps.items():
+            for e in entries:
+                label = e.label or name
+                # Normalizar labels conhecidos
+                lname = name.lower()
+                if "core" in lname or "k10temp" in lname or "cpu" in lname:
+                    label = "CPU"
+                elif "gpu" in lname or "amdgpu" in lname or "nvidia" in lname:
+                    label = "GPU"
+                elif "acpitz" in lname or "ambient" in lname:
+                    label = "AMB"
+                out.append({"label": label, "temp": round(e.current, 1)})
+    except Exception:
+        pass
+    # Deduplicar por label (pegar o maior)
+    seen = {}
+    for t in out:
+        if t["label"] not in seen or t["temp"] > seen[t["label"]]["temp"]:
+            seen[t["label"]] = t
+    return list(seen.values())
+
+def battery_info() -> dict | None:
+    try:
+        b = psutil.sensors_battery()
+        if b is None:
+            return None
+        info = {"pct": round(b.percent, 1), "plugged": bool(b.power_plugged), "status": None}
+        # Tentar ler status do sysfs se power_plugged for None
+        if b.power_plugged is None:
+            ac = detect_ac_adapter()
+            if ac:
+                info["plugged"] = Path(f"{ac}/online").read_text().strip() == "1"
+        # Tempo restante (só se descarregando e válido)
+        if not info["plugged"] and b.secsleft not in (psutil.POWER_TIME_UNLIMITED, psutil.POWER_TIME_UNKNOWN):
+            info["remaining_s"] = int(b.secsleft)
+        return info
+    except Exception:
+        return None
+
+def detect_ac_adapter() -> str | None:
+    for p in Path("/sys/class/power_supply").glob("ADP*"), Path("/sys/class/power_supply").glob("AC*"), Path("/sys/class/power_supply").glob("ac*"):
+        for d in p:
+            if (d / "online").exists():
+                return str(d)
+    return None
+
+# ---------- Top processos via /proc (rápido) ----------
+_proc_cache: dict = {}
+
+def _proc_times(pid: str):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    end = raw.rfind(b")")
+    if end < 0:
+        return None
+    parts = raw[end + 2:].split()
+    if len(parts) < 22:
+        return None
+    try:
+        return (int(parts[11]) + int(parts[12]), int(parts[19]), int(parts[21]) * PAGE_SIZE)
+    except (ValueError, IndexError):
+        return None
+
+def _scan_procs(cache: dict) -> tuple[dict, float]:
+    now = time.monotonic()
+    prev = cache.get("ticks") or {}
+    prev_t = cache.get("t", now)
+    dt = max(now - prev_t, 0.2)
+    cur = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        st = _proc_times(entry.name)
+        if st:
+            cur[int(entry.name)] = st
+    cache["ticks"] = cur
+    cache["t"] = now
+    return prev, dt
+
+def top_procs(n: int, cache: dict | None = None) -> list[dict]:
+    if cache is None:
+        # Primeira chamada ou --once: usar psutil (números corretos imediatos)
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "cpu_percent"]):
+            try:
+                procs.append({"pid": p.info["pid"], "name": p.info["name"], "cpu": p.info["cpu_percent"] or 0.0})
+            except Exception:
+                pass
+        procs.sort(key=lambda x: -x["cpu"])
+        out = []
+        for p in procs[:n]:
+            try:
+                mi = psutil.Process(p["pid"]).memory_info()
+                p["mem"] = mi.rss
+            except Exception:
+                p["mem"] = 0
+            out.append(p)
+        return out
+
+    if not cache.get("ticks"):
+        # Semear cache
+        _ = top_procs(n, None)
+        _scan_procs(cache)
+        return _
+
+    prev, dt = _scan_procs(cache)
+    rows = []
+    for pid, (ticks, start, rss) in cache["ticks"].items():
+        old = prev.get(pid)
+        cpu = 0.0 if not old or old[1] != start else max(0.0, (ticks - old[0]) / CLK_TCK / dt * 100)
+        if cpu > 0:
+            rows.append((pid, cpu, rss))
+    rows.sort(key=lambda r: -r[1])
+    out = []
+    for pid, cpu, rss in rows[:n]:
+        try:
+            name = Path(f"/proc/{pid}/comm").read_text().strip().removesuffix(".exe") or "?"
+        except OSError:
+            name = "?"
+        out.append({"name": name, "cpu": round(cpu, 1), "mem": int(rss), "pid": pid})
+    return out
+
+# ---------- WiFi + IP local ----------
+def wifi_info() -> dict:
+    # Detectar interface ativa com rota default
+    iface = ""
+    out = run_text(["ip", "-4", "route", "show", "default"])
+    if out:
+        m = re.search(r"dev\s+(\S+)", out)
+        if m:
+            iface = m.group(1)
+    if not iface:
+        # Fallback: primeira interface up não-lo
+        out = run_text(["ip", "-4", "-o", "link", "show", "up"])
+        if out:
+            for line in out.splitlines():
+                if "lo" not in line:
+                    m = re.search(r":\s+(\S+):", line)
+                    if m:
+                        iface = m.group(1)
+                        break
+    if not iface:
+        return {"ssid": None, "dbm": None, "tx_rate": None, "ip": None, "iface": None}
+
+    info = {"iface": iface, "ssid": None, "dbm": None, "tx_rate": None, "ip": None}
+    
+    # iw para SSID/sinal/taxa
+    out = run_text(["iw", "dev", iface, "link"])
+    if out and "Not connected" not in out and "Connected to" in out:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("SSID:"):
+                info["ssid"] = line.split(":", 1)[1].strip()
+            elif "signal:" in line:
+                try:
+                    info["dbm"] = int(line.split()[1].replace("dBm", ""))
+                except Exception:
+                    pass
+            elif "tx bitrate:" in line:
+                try:
+                    info["tx_rate"] = float(line.split(":")[1].strip().split()[0])
+                except Exception:
+                    pass
+    
+    # IP local
+    out = run_text(["ip", "-4", "-o", "addr", "show", "dev", iface])
+    if out:
+        for tok in out.split():
+            if tok == "inet":
+                # próximo token é IP/CIDR
+                try:
+                    info["ip"] = out.split()[out.split().index("inet") + 1].split("/")[0]
+                except Exception:
+                    pass
+                break
+    return info
+
+def default_gateway() -> str | None:
+    out = run_text(["ip", "-4", "route", "show", "default"])
+    if out and "via" in out:
+        parts = out.split()
+        try:
+            return parts[parts.index("via") + 1]
+        except Exception:
+            pass
+    return None
+
+def ping_once() -> dict:
+    gw = default_gateway()
+    ms = None
+    if gw:
+        try:
+            out = subprocess.run(
+                ["ping", "-n", "-c1", "-W1", gw],
+                capture_output=True, text=True, timeout=3,
+                env={**os.environ, "LC_ALL": "C"},
+            ).stdout
+            m = re.search(r"(?:time|tempo)=([\d.]+)\s*ms", out)
+            if m:
+                ms = round(float(m.group(1)), 1)
+        except Exception:
+            pass
+    return {"gateway": gw, "ms": ms}
+
+# ---------- Load average, uptime, frequência ----------
+def load_info() -> dict:
+    try:
+        l1, l5, l15 = os.getloadavg()
+    except OSError:
+        l1 = l5 = l15 = 0.0
+    try:
+        uptime = int(time.clock_gettime(time.CLOCK_BOOTTIME))
+    except Exception:
+        uptime = 0
+    freq = None
+    try:
+        f = psutil.cpu_freq()
+        if f and f.current:
+            freq = round(f.current)
+    except Exception:
+        pass
+    return {"avg": [round(l1, 2), round(l5, 2), round(l15, 2)], "uptime_s": uptime, "freq_mhz": freq}
+
+# ---------- Atualizações (por distro) ----------
+def updates_info() -> dict | None:
+    distro = detect_distro_name()
+    cmd = None
+    if distro in ("arch", "manjaro", "endeavouros", "garuda", "artix"):
+        cmd = ["checkupdates"]
+    elif distro in ("fedora", "rhel", "centos", "rocky", "almalinux"):
+        cmd = ["dnf", "check-update", "-q"]
+    elif distro in ("ubuntu", "debian", "linuxmint", "pop", "zorin", "elementary"):
+        cmd = ["apt", "list", "--upgradable"]
+    elif distro == "nixos":
+        cmd = ["nix", "store", "gc", "--dry-run"]  # proxy
+    elif distro in ("opensuse", "suse"):
+        cmd = ["zypper", "list-updates"]
+    
+    if not cmd:
+        return {"count": 0, "reboot": False, "source": "unknown"}
+    
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+        count = 0
+        if distro in ("arch", "manjaro", "endeavouros", "garuda", "artix"):
+            count = len([l for l in out.splitlines() if l.strip()])
+        elif distro in ("fedora", "rhel", "centos", "rocky", "almalinux"):
+            count = len([l for l in out.splitlines() if l and not l.startswith("Last metadata")])
+        elif distro in ("ubuntu", "debian", "linuxmint", "pop", "zorin", "elementary"):
+            count = len([l for l in out.splitlines() if l and not l.startswith("Listing")])
+        elif distro == "nixos":
+            count = 0  # nixos é diferente
+        elif distro in ("opensuse", "suse"):
+            count = len([l for l in out.splitlines() if l and "|" in l and not l.startswith("Loading")])
+        
+        reboot = Path("/var/run/reboot-required").exists() or Path("/run/reboot-required").exists()
+        return {"count": count, "reboot": reboot, "source": distro}
+    except Exception:
+        return {"count": 0, "reboot": False, "source": distro, "error": True}
+
+_distro_cache = None
+def detect_distro_name() -> str:
+    global _distro_cache
+    if _distro_cache:
+        return _distro_cache
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    _distro_cache = line.split("=", 1)[1].strip().strip('"')
+                    return _distro_cache
+    except Exception:
+        pass
+    _distro_cache = "unknown"
+    return _distro_cache
+
+# ---------- Screen time (Omarchy) ----------
+def screentime_today() -> dict | None:
+    p = Path.home() / ".config" / "omarchy" / "screen-time" / "history.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        today = date.today().isoformat()
+        ms = data.get("days", {}).get(today, 0)
+        return {"today_ms": ms, "today_h": round(ms / 3_600_000, 1)}
+    except Exception:
+        return None
+
+# ---------- Clima (Open-Meteo, geocoding automático) ----------
+def geocode_city(city: str) -> tuple[float, float] | None:
+    try:
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={urllib.parse.quote(city)}&count=1&language=pt&format=json"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if data.get("results"):
+                r = data["results"][0]
+                return (r["latitude"], r["longitude"])
+    except Exception:
+        pass
+    return None
+
+def weather_info(cfg: dict) -> dict | None:
+    city = cfg.get("weather_city", "auto")
+    lat = cfg.get("weather_lat")
+    lon = cfg.get("weather_lon")
+    
+    if (lat is None or lon is None) and city != "auto":
+        coords = geocode_city(city)
+        if coords:
+            lat, lon = coords
+    
+    # Fallback: São Paulo
+    if lat is None or lon is None:
+        lat, lon = -23.55, -46.63
+    
+    # Cache 30 min
+    try:
+        if WEATHER_CACHE.exists():
+            mtime = WEATHER_CACHE.stat().st_mtime
+            if time.time() - mtime < 1800:
+                cached = json.loads(WEATHER_CACHE.read_text())
+                cached["stale"] = False
+                return cached
+    except Exception:
+        pass
+    
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto&forecast_days=2"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        cw = data.get("current_weather", {})
+        daily = data.get("daily", {})
+        out = {
+            "temp": cw.get("temperature"),
+            "wind": cw.get("windspeed"),
+            "code": cw.get("weathercode"),
+            "max": daily.get("temperature_2m_max", [None])[0],
+            "min": daily.get("temperature_2m_min", [None])[0],
+            "city": city,
+            "stale": False,
+            "lat": lat,
+            "lon": lon,
+        }
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        WEATHER_CACHE.write_text(json.dumps(out, indent=1))
+        return out
+    except Exception as e:
+        # Retornar cache mesmo expirado
+        try:
+            cached = json.loads(WEATHER_CACHE.read_text())
+            cached["stale"] = True
+            return cached
+        except Exception:
+            return {"error": str(e), "stale": True}
+
+# ---------- Workers lentos (threads separadas) ----------
+def ping_worker(interval: int = 60) -> None:
+    while True:
+        _slow["ping"] = ping_once()
+        time.sleep(interval)
+
+def updates_worker(interval: int = 3 * 3600) -> None:
+    while True:
+        upd = updates_info()
+        if upd:
+            with _slow_lock:
+                _slow["updates"] = upd
+        time.sleep(interval)
+
+def weather_worker(interval: int = 30 * 60, cfg: dict = None) -> None:
+    while True:
+        w = weather_info(cfg or {})
+        if w:
+            with _slow_lock:
+                _slow["weather"] = w
+        time.sleep(interval)
+
+# ---------- Snapshot consolidado ----------
+def snapshot(cfg: dict, prev: dict) -> dict:
+    with _slow_lock:
+        updates = _slow.get("updates") or {}
+        weather = _slow.get("weather") or {}
+        ping = _slow.get("ping") or {}
+    
+    wifi = prev.get("wifi") or {"ssid": None, "dbm": None, "tx_rate": None, "ip": None, "iface": None}
+    
+    return {
+        "generated_at": date.today().isoformat() + "T" + time.strftime("%H:%M:%S"),
+        "cpu": cpu_info(),
+        "mem": mem_info(),
+        "disk": disk_info(cfg.get("mount", "/")),
+        "net": {
+            "down_bps": prev.get("net_down", 0),
+            "up_bps": prev.get("net_up", 0),
+            **wifi,
+            "gateway": ping.get("gateway"),
+            "ping_ms": ping.get("ms"),
+        },
+        "load": load_info(),
+        "battery": prev.get("battery"),
+        "temps": prev.get("temps") or [],
+        "procs": prev.get("procs") or [],
+        "updates": updates,
+        "weather": weather,
+        "screentime": prev.get("screentime"),
+    }
+
+# ---------- Main loop ----------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Coleta métricas de sistema para usage-widget (portável)")
+    ap.add_argument("--once", action="store_true", help="Coleta única e sai")
+    ap.add_argument("--watch", type=int, default=3, help="Intervalo do loop rápido (segundos)")
+    args = ap.parse_args()
+
+    cfg = load_system_cfg()
+    interval = max(1, args.watch)
+
+    prev: dict = {"t": time.time()}
+    last = {
+        "procs": 0.0, "temps": 0.0, "battery": 0.0,
+        "wifi": 0.0, "screentime": 0.0,
+    }
+    proc_cache: dict = {}
+
+    if args.once:
+        prev["procs"] = top_procs(cfg.get("procs_top", 5))
+        prev["wifi"] = wifi_info()
+        prev["temps"] = temps_info()
+        prev["battery"] = battery_info()
+        prev["screentime"] = screentime_today()
+        prev["net_down"] = net_info()["down_bps"]
+        prev["net_up"] = net_info()["up_bps"]
+        ping_once()  # popular _slow["ping"]
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        tmp = SYSTEM.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot(cfg, prev), indent=1))
+        os.replace(tmp, SYSTEM)
+        return
+
+    # Workers lentos
+    threading.Thread(target=ping_worker, daemon=True).start()
+    threading.Thread(target=updates_worker, daemon=True).start()
+    threading.Thread(target=weather_worker, args=(30 * 60, cfg), daemon=True).start()
+
+    # Primeiro ciclo rápido
+    prev["procs"] = top_procs(cfg.get("procs_top", 5))
+    prev["wifi"] = wifi_info()
+    prev["temps"] = temps_info()
+    prev["battery"] = battery_info()
+    prev["screentime"] = screentime_today()
+    net = net_info()
+    prev["net_down"] = net["down_bps"]
+    prev["net_up"] = net["up_bps"]
+    ping_once()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    tmp = SYSTEM.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(snapshot(cfg, prev), indent=1))
+    os.replace(tmp, SYSTEM)
+
+    next_tick = time.time()
+    while True:
+        now = time.time()
+        # Loop rápido: CPU, RAM, disco, rede a cada tick
+        cpu = cpu_info()
+        mem = mem_info()
+        disk = disk_info(cfg.get("mount", "/"))
+        net = net_info()
+        
+        # Sub-cadências
+        if now - last["temps"] >= 5:
+            prev["temps"] = temps_info()
+            prev["battery"] = battery_info()
+            last["temps"] = last["battery"] = now
+        if now - last["procs"] >= 10:
+            prev["procs"] = top_procs(cfg.get("procs_top", 5), proc_cache)
+            last["procs"] = now
+        if now - last["wifi"] >= 30:
+            prev["wifi"] = wifi_info()
+            last["wifi"] = now
+        if now - last["screentime"] >= 30:
+            prev["screentime"] = screentime_today()
+            last["screentime"] = now
+        
+        prev["net_down"] = net["down_bps"]
+        prev["net_up"] = net["up_bps"]
+        
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        tmp = SYSTEM.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot(cfg, prev), indent=1))
+        os.replace(tmp, SYSTEM)
+
+        next_tick += interval
+        sleep = max(0, next_tick - time.time())
+        time.sleep(sleep)
+
+if __name__ == "__main__":
+    main()

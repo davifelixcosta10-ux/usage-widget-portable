@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+Conta requisições do OpenCode Zen no banco SQLite
+Versão portável (sem dependências externas além de stdlib)
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+DB = Path(os.environ.get("OPENCODE_DB", "~/.local/share/opencode/opencode.db")).expanduser()
+
+def load() -> dict:
+    now = int(time.time() * 1000)
+    out = {
+        "windows": {"5h": {"zen": 0, "outros": {}}, "24h": {"zen": 0, "outros": {}}},
+        "models_5h": {},
+        "oldest_5h": None,
+        "oldest_24h": None,
+        "free_limit": None,
+    }
+    if not DB.exists():
+        return out
+
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        return out
+
+    # Free limit (429)
+    try:
+        row = con.execute("""
+            SELECT time_created, json_extract(data, '$.error.retryAfterMs')
+            FROM session_message
+            WHERE type='assistant' AND json_extract(data, '$.error.status')=429
+            ORDER BY time_created DESC LIMIT 1
+        """).fetchone()
+        if row:
+            at, retry = row
+            out["free_limit"] = {
+                "at": at,
+                "retry_ms": retry,
+                "until": at + retry,
+                "active": now < (at + retry),
+            }
+    except Exception:
+        pass
+
+    # Contagens 5h e 24h
+    for window_ms, window_name in [(5*3600*1000, "5h"), (24*3600*1000, "24h")]:
+        since = now - window_ms
+        try:
+            rows = con.execute("""
+                SELECT COALESCE(json_extract(data, '$.model.providerID'), '?'),
+                       COALESCE(json_extract(data, '$.model.id'), '?'),
+                       time_created
+                FROM session_message
+                WHERE type='assistant' AND time_created>=?
+            """, (since,)).fetchall()
+        except Exception:
+            continue
+
+        for prov, model, ts in rows:
+            key = f"{prov}/{model}" if prov != "?" else model
+            out["windows"][window_name]["zen"] = out["windows"][window_name].get("zen", 0) + 1
+            if window_name == "5h":
+                out["models_5h"][key] = out["models_5h"].get(key, 0) + 1
+            # oldest
+            if out[f"oldest_{window_name}"] is None or ts < out[f"oldest_{window_name}"]:
+                out[f"oldest_{window_name}"] = ts
+
+    # Demais provedores (não-zen)
+    try:
+        rows = con.execute("""
+            SELECT COALESCE(json_extract(data, '$.model.providerID'), '?'),
+                   time_created
+            FROM session_message
+            WHERE type='assistant' AND time_created>=? AND json_extract(data, '$.model.providerID') != 'opencode'
+        """, (now - 5*3600*1000,)).fetchall()
+        for prov, ts in rows:
+            out["windows"]["5h"]["outros"][prov] = out["windows"]["5h"]["outros"].get(prov, 0) + 1
+        rows = con.execute("""
+            SELECT COALESCE(json_extract(data, '$.model.providerID'), '?'), time_created
+            FROM session_message WHERE type='assistant' AND time_created>=? AND json_extract(data, '$.model.providerID') != 'opencode'
+        """, (now - 24*3600*1000,)).fetchall()
+        for prov, ts in rows:
+            out["windows"]["24h"]["outros"][prov] = out["windows"]["24h"]["outros"].get(prov, 0) + 1
+    except Exception:
+        pass
+
+    con.close()
+    return out
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    data = load()
+    if args.json:
+        json.dump(data, sys.stdout, indent=1)
+    else:
+        w5 = data["windows"]["5h"]; w24 = data["windows"]["24h"]
+        print(f"5h:  zen={w5['zen']}  outros={w5['outros']}")
+        print(f"24h: zen={w24['zen']}  outros={w24['outros']}")
+        if data["free_limit"]:
+            fl = data["free_limit"]
+            print(f"429: at={fl['at']} retry={fl['retry_ms']}ms active={fl['active']}")
+
+if __name__ == "__main__":
+    main()

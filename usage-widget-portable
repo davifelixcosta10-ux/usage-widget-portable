@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Launcher portável do usage-widget
+# Detecta ambiente, exporta MALLOC_CONF para jemalloc, sobe coletores e widget
+
+set -euo pipefail
+
+# Carregar detector
+DETECT_SCRIPT="${DETECT_SCRIPT:-$HOME/.local/share/usage-widget/portable/detect-env.sh}"
+if [[ -f "$DETECT_SCRIPT" ]]; then
+    # shellcheck source=/dev/null
+    source "$DETECT_SCRIPT"
+    if ! check_compatibility; then
+        echo
+        echo "⚠  Ambiente não totalmente compatível. Tentando mesmo assim..."
+        echo "   (Pode falhar se não tiver Wayland + layer-shell + Quickshell)"
+        echo
+    fi
+else
+    echo "[AVISO] detect-env.sh não encontrado, pulando verificação"
+fi
+
+# jemalloc tuning (quickshell usa jemalloc)
+export MALLOC_CONF="${MALLOC_CONF:-dirty_decay_ms:0,muzzy_decay_ms:0,retain:false,narenas:2}"
+
+CFG="$HOME/.config/usage-widget"
+mkdir -p "$CFG" "$HOME/.cache/usage-widget"
+[[ -f "$CFG/position.json" ]] || echo '{"x": -1, "y": -1, "tab": 0}' > "$CFG/position.json"
+
+# Coletores (usam versões portáveis se existirem, senão as do ~/.local/bin)
+USAGE_STATE="${USAGE_STATE:-$HOME/.local/bin/usage-state}"
+SYS_STATE="${SYS_STATE:-$HOME/.local/bin/sys-state}"
+
+# Verificar se versões portáveis existem e são mais novas
+for portable in "$HOME/.local/share/usage-widget/portable/usage-state-portable" \
+                "$HOME/.local/share/usage-widget/portable/sys-state-portable"; do
+    if [[ -f "$portable" ]]; then
+        base=$(basename "$portable" -portable)
+        if [[ ! -f "$HOME/.local/bin/$base" ]] || [[ "$portable" -nt "$HOME/.local/bin/$base" ]]; then
+            echo "[INFO] Usando versão portável: $base"
+            if [[ "$base" == "usage-state" ]]; then USAGE_STATE="$portable"; fi
+            if [[ "$base" == "sys-state" ]]; then SYS_STATE="$portable"; fi
+        fi
+    fi
+done
+
+# Subir coletores
+if ! pgrep -f "$(basename "$USAGE_STATE")" >/dev/null 2>&1; then
+    setsid "$USAGE_STATE" --watch 60 </dev/null >/dev/null 2>&1 &
+fi
+
+if ! pgrep -f "$(basename "$SYS_STATE")" >/dev/null 2>&1; then
+    setsid "$SYS_STATE" --watch 3 </dev/null >/dev/null 2>&1 &
+fi
+
+# Quickshell
+exec quickshell -c usage-widget --no-duplicate --daemonize
