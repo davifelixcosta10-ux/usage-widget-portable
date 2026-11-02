@@ -51,7 +51,7 @@ def load() -> dict:
     except Exception:
         pass
 
-    # Contagens 5h e 24h
+    # Contagens 5h e 24h — APENAS provider 'opencode' (Zen Free)
     for window_ms, window_name in [(5*3600*1000, "5h"), (24*3600*1000, "24h")]:
         since = now - window_ms
         try:
@@ -60,7 +60,7 @@ def load() -> dict:
                        COALESCE(json_extract(data, '$.model.id'), '?'),
                        time_created
                 FROM session_message
-                WHERE type='assistant' AND time_created>=?
+                WHERE type='assistant' AND time_created>=? AND json_extract(data, '$.model.providerID') = 'opencode'
             """, (since,)).fetchall()
         except Exception:
             continue
